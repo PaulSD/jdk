@@ -27,6 +27,7 @@ package sun.net.www.http;
 
 import java.io.IOException;
 import java.io.NotSerializableException;
+import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.URL;
@@ -36,18 +37,230 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 
 import jdk.internal.misc.InnocuousThread;
+import sun.net.www.MeteredStream;
 import sun.security.action.GetIntegerAction;
 
 /**
- * A class that implements a cache of idle Http connections for keep-alive
+ * A class that implements a cache of active/idle Http connections for keep-alive
  *
  * @author Stephen R. Pietrowicz (NCSA)
  * @author Dave Brown
+ * @author Paul Donohue
  */
-public class KeepAliveCache
-    extends HashMap<KeepAliveKey, ClientVector>
+public class KeepAliveCache {
+    protected ActiveKeepAliveCache active = new ActiveKeepAliveCache();
+    protected IdleKeepAliveCache idle = new IdleKeepAliveCache();
+
+    public KeepAliveCache() {}
+
+    /**
+     * Register this active HttpClient with the cache
+     * @param http  The HttpClient to be cached
+     * @param owner The HttpURLConnection that is currently using this HttpClient
+     */
+    public void putActive(HttpClient http, Object owner) {
+        if (owner != null)
+            active.put(http, owner);
+    }
+
+    /**
+     * Register this URL and HttpClient (that supports keep-alive) as idle and
+     * available for reuse
+     * @param url   The URL contains info about the host and port
+     * @param http  The HttpClient to be marked as idle
+     */
+    public void putIdle(final URL url, Object obj, HttpClient http) {
+        active.remove(http);
+        idle.put(url, obj, http);
+    }
+
+    /**
+     * Check to see if this URL has an available idle HttpClient
+     */
+    public HttpClient getIdle(final URL url, Object obj, Object owner) {
+        HttpClient http = idle.get(url, obj);
+        if (http != null && owner != null)
+            active.put(http, owner);
+        return http;
+    }
+
+    /**
+     * Explicitly remove this HttpClient from the cache
+     */
+    public void remove(HttpClient http, Object obj) {
+        active.remove(http);
+        idle.remove(http, obj);
+    }
+
+    /**
+     * @deprecated Use putIdle() instead.
+     */
+    @Deprecated
+    public void put(final URL url, Object obj, HttpClient http) {
+        putIdle(url, obj, http);
+    }
+
+    /**
+     * @deprecated Use getIdle() instead.
+     */
+    @Deprecated
+    public HttpClient get(URL url, Object obj) {
+        return getIdle(url, obj, null);
+    }
+}
+
+
+/*
+ * The Active cache is used to reclaim HttpClient objects when the associated
+ * owner (HttpURLConnection) objects are garbage collected.  Without this, the
+ * MeteredStream finalizer and KeepAliveStream close() method may resurrect an
+ * HttpClient object after the garbage collector has started collecting it,
+ * which can lead to various race conditions between the garbage collector and
+ * user threads.
+ */
+class ActiveKeepAliveCache
+    implements Runnable {
+
+    protected ActiveKeepAliveOwnerMap owners = new ActiveKeepAliveOwnerMap();
+    protected ReferenceQueue<Object> deadOwnersQ = new ReferenceQueue<Object>();
+    protected ActiveKeepAliveClientMap clients = new ActiveKeepAliveClientMap();
+    private Thread gcHandler = null;
+
+    public ActiveKeepAliveCache() {}
+
+    public synchronized void put(HttpClient http, Object owner) {
+        WeakReference<Object> ownerRef = new WeakReference<Object>(owner, deadOwnersQ);
+        owners.put(ownerRef, new WeakReference<HttpClient>(http));
+        clients.put(http, ownerRef);
+
+        if (gcHandler == null || !gcHandler.isAlive()) {
+            final ActiveKeepAliveCache cache = this;
+            AccessController.doPrivileged(new PrivilegedAction<>() {
+                public Void run() {
+                    gcHandler = InnocuousThread.newSystemThread("Keep-Alive-GC-Handler", cache);
+                    gcHandler.setDaemon(true);
+                    gcHandler.setPriority(Thread.MAX_PRIORITY - 2);
+                    gcHandler.start();
+                    return null;
+                }
+            });
+        }
+    }
+
+    public synchronized void remove(HttpClient http) {
+        WeakReference<Object> ownerRef = clients.remove(http);
+        if (ownerRef != null) {
+            owners.remove(ownerRef);
+        }
+    }
+
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                Reference<? extends Object> deadOwnerRef = deadOwnersQ.remove();
+                HttpClient http = null;
+                synchronized (this) {
+                    WeakReference<HttpClient> httpRef = owners.remove(deadOwnerRef);
+                    if (httpRef != null) {
+                        http = httpRef.get();
+                        if (http != null) {
+                            WeakReference<Object> ownerRef = clients.remove(http);
+                            if (ownerRef == null || ownerRef != deadOwnerRef) {
+                                // Shouldn't happen, but theoretically possible
+                                // if something calls put() twice with the same
+                                // HttpClient but two different owners
+                                http = null;
+                            }
+                        }
+                    }
+                }
+                if (http != null) {
+                    // KeepAliveCache.setIdle() is usually called before the
+                    // owner (HttpURLConnection) is garbage collected.
+                    // However, that may not happen if the user of
+                    // HttpURLConnection did not either close or fully read the
+                    // response InputStream.   In that case, closing it here
+                    // will cause KeepAliveCache.setIdle() to be called if
+                    // appropriate.
+                    // Otherwise, KeepAliveCache.setIdle() was not called
+                    // because the HttpClient cannot be reused and we should
+                    // allow it to be garbage collected.
+                    InputStream is = http.getInputStream();
+                    if (is != null &&
+                        (is instanceof ChunkedInputStream ||
+                         is instanceof MeteredStream)) {
+                        try {
+                            is.close();
+                        } catch (IOException e) {}
+                    }
+                }
+            } catch (InterruptedException e) {}
+            synchronized (this) {
+                if (owners.isEmpty()) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+
+class ActiveKeepAliveOwnerMap
+    extends HashMap<WeakReference<Object>, WeakReference<HttpClient>> {
+    @java.io.Serial
+    private static final long serialVersionUID = -1516438533168901532L;
+
+    public ActiveKeepAliveOwnerMap() {}
+
+    /*
+     * Do not serialize this class!
+     */
+    @java.io.Serial
+    private void writeObject(ObjectOutputStream stream) throws IOException {
+        throw new NotSerializableException();
+    }
+
+    @java.io.Serial
+    private void readObject(ObjectInputStream stream)
+        throws IOException, ClassNotFoundException
+    {
+        throw new NotSerializableException();
+    }
+}
+
+
+class ActiveKeepAliveClientMap
+    extends HashMap<HttpClient, WeakReference<Object>> {
+    @java.io.Serial
+    private static final long serialVersionUID = -2431098254089313531L;
+
+    public ActiveKeepAliveClientMap() {}
+
+    /*
+     * Do not serialize this class!
+     */
+    @java.io.Serial
+    private void writeObject(ObjectOutputStream stream) throws IOException {
+        throw new NotSerializableException();
+    }
+
+    @java.io.Serial
+    private void readObject(ObjectInputStream stream)
+        throws IOException, ClassNotFoundException
+    {
+        throw new NotSerializableException();
+    }
+}
+
+
+class IdleKeepAliveCache
+    extends HashMap<IdleKeepAliveKey, IdleClientVector>
     implements Runnable {
     @java.io.Serial
     private static final long serialVersionUID = -2937172892064557949L;
@@ -79,7 +292,7 @@ public class KeepAliveCache
     /**
      * Constructor
      */
-    public KeepAliveCache() {}
+    public IdleKeepAliveCache() {}
 
     /**
      * Register this URL and HttpClient (that supports keep-alive) with the cache
@@ -87,13 +300,7 @@ public class KeepAliveCache
      * @param http The HttpClient to be cached
      */
     public synchronized void put(final URL url, Object obj, HttpClient http) {
-        boolean startThread = (keepAliveTimer == null);
-        if (!startThread) {
-            if (!keepAliveTimer.isAlive()) {
-                startThread = true;
-            }
-        }
-        if (startThread) {
+        if (keepAliveTimer == null || !keepAliveTimer.isAlive()) {
             clear();
             /* Unfortunately, we can't always believe the keep-alive timeout we got
              * back from the server.  If I'm connected through a Netscape proxy
@@ -101,7 +308,7 @@ public class KeepAliveCache
              * time of 15 sec, the proxy unilaterally terminates my connection
              * The robustness to get around this is in HttpClient.parseHTTP()
              */
-            final KeepAliveCache cache = this;
+            final IdleKeepAliveCache cache = this;
             AccessController.doPrivileged(new PrivilegedAction<>() {
                 public Void run() {
                     keepAliveTimer = InnocuousThread.newSystemThread("Keep-Alive-Timer", cache);
@@ -113,12 +320,12 @@ public class KeepAliveCache
             });
         }
 
-        KeepAliveKey key = new KeepAliveKey(url, obj);
-        ClientVector v = super.get(key);
+        IdleKeepAliveKey key = new IdleKeepAliveKey(url, obj);
+        IdleClientVector v = super.get(key);
 
         if (v == null) {
             int keepAliveTimeout = http.getKeepAliveTimeout();
-            v = new ClientVector(keepAliveTimeout > 0 ?
+            v = new IdleClientVector(keepAliveTimeout > 0 ?
                                  keepAliveTimeout * 1000 : LIFETIME);
             v.put(http);
             super.put(key, v);
@@ -129,8 +336,8 @@ public class KeepAliveCache
 
     /* remove an obsolete HttpClient from its VectorCache */
     public synchronized void remove(HttpClient h, Object obj) {
-        KeepAliveKey key = new KeepAliveKey(h.url, obj);
-        ClientVector v = super.get(key);
+        IdleKeepAliveKey key = new IdleKeepAliveKey(h.url, obj);
+        IdleClientVector v = super.get(key);
         if (v != null) {
             v.remove(h);
             if (v.isEmpty()) {
@@ -142,7 +349,7 @@ public class KeepAliveCache
     /* called by a clientVector thread when all its connections have timed out
      * and that vector of connections should be removed.
      */
-    synchronized void removeVector(KeepAliveKey k) {
+    synchronized void removeVector(IdleKeepAliveKey k) {
         super.remove(k);
     }
 
@@ -150,15 +357,15 @@ public class KeepAliveCache
      * Check to see if this URL has a cached HttpClient
      */
     public synchronized HttpClient get(URL url, Object obj) {
-        KeepAliveKey key = new KeepAliveKey(url, obj);
-        ClientVector v = super.get(key);
+        IdleKeepAliveKey key = new IdleKeepAliveKey(url, obj);
+        IdleClientVector v = super.get(key);
         if (v == null) { // nothing in cache yet
             return null;
         }
         return v.get();
     }
 
-    /* Sleeps for an alloted timeout, then checks for timed out connections.
+    /* Sleeps for an allotted timeout, then checks for timed out connections.
      * Errs on the side of caution (leave connections idle for a relatively
      * short time).
      */
@@ -172,12 +379,12 @@ public class KeepAliveCache
             // Remove all outdated HttpClients.
             synchronized (this) {
                 long currentTime = System.currentTimeMillis();
-                List<KeepAliveKey> keysToRemove = new ArrayList<>();
+                List<IdleKeepAliveKey> keysToRemove = new ArrayList<>();
 
-                for (KeepAliveKey key : keySet()) {
-                    ClientVector v = get(key);
+                for (IdleKeepAliveKey key : keySet()) {
+                    IdleClientVector v = get(key);
                     synchronized (v) {
-                        KeepAliveEntry e = v.peek();
+                        IdleKeepAliveEntry e = v.peek();
                         while (e != null) {
                             if ((currentTime - e.idleStartTime) > v.nap) {
                                 v.poll();
@@ -194,7 +401,7 @@ public class KeepAliveCache
                     }
                 }
 
-                for (KeepAliveKey key : keysToRemove) {
+                for (IdleKeepAliveKey key : keysToRemove) {
                     removeVector(key);
                 }
             }
@@ -220,14 +427,14 @@ public class KeepAliveCache
 /* FILO order for recycling HttpClients, should run in a thread
  * to time them out.  If > maxConns are in use, block.
  */
-class ClientVector extends ArrayDeque<KeepAliveEntry> {
+class IdleClientVector extends ArrayDeque<IdleKeepAliveEntry> {
     @java.io.Serial
     private static final long serialVersionUID = -8680532108106489459L;
 
     // sleep time in milliseconds, before cache clear
     int nap;
 
-    ClientVector(int nap) {
+    IdleClientVector(int nap) {
         this.nap = nap;
     }
 
@@ -240,7 +447,7 @@ class ClientVector extends ArrayDeque<KeepAliveEntry> {
         HttpClient hc = null;
         long currentTime = System.currentTimeMillis();
         do {
-            KeepAliveEntry e = pop();
+            IdleKeepAliveEntry e = pop();
             if ((currentTime - e.idleStartTime) > nap) {
                 e.hc.closeServer();
             } else {
@@ -252,16 +459,16 @@ class ClientVector extends ArrayDeque<KeepAliveEntry> {
 
     /* return a still valid, unused HttpClient */
     synchronized void put(HttpClient h) {
-        if (size() >= KeepAliveCache.getMaxConnections()) {
+        if (size() >= IdleKeepAliveCache.getMaxConnections()) {
             h.closeServer(); // otherwise the connection remains in limbo
         } else {
-            push(new KeepAliveEntry(h, System.currentTimeMillis()));
+            push(new IdleKeepAliveEntry(h, System.currentTimeMillis()));
         }
     }
 
     /* remove an HttpClient */
     synchronized boolean remove(HttpClient h) {
-        for (KeepAliveEntry curr : this) {
+        for (IdleKeepAliveEntry curr : this) {
             if (curr.hc == h) {
                 return super.remove(curr);
             }
@@ -285,7 +492,7 @@ class ClientVector extends ArrayDeque<KeepAliveEntry> {
     }
 }
 
-class KeepAliveKey {
+class IdleKeepAliveKey {
     private String      protocol = null;
     private String      host = null;
     private int         port = 0;
@@ -296,7 +503,7 @@ class KeepAliveKey {
      *
      * @param url the URL containing the protocol, host and port information
      */
-    public KeepAliveKey(URL url, Object obj) {
+    public IdleKeepAliveKey(URL url, Object obj) {
         this.protocol = url.getProtocol();
         this.host = url.getHost();
         this.port = url.getPort();
@@ -308,9 +515,9 @@ class KeepAliveKey {
      */
     @Override
     public boolean equals(Object obj) {
-        if ((obj instanceof KeepAliveKey) == false)
+        if ((obj instanceof IdleKeepAliveKey) == false)
             return false;
-        KeepAliveKey kae = (KeepAliveKey)obj;
+        IdleKeepAliveKey kae = (IdleKeepAliveKey)obj;
         return host.equals(kae.host)
             && (port == kae.port)
             && protocol.equals(kae.protocol)
@@ -329,11 +536,11 @@ class KeepAliveKey {
     }
 }
 
-class KeepAliveEntry {
+class IdleKeepAliveEntry {
     HttpClient hc;
     long idleStartTime;
 
-    KeepAliveEntry(HttpClient hc, long idleStartTime) {
+    IdleKeepAliveEntry(HttpClient hc, long idleStartTime) {
         this.hc = hc;
         this.idleStartTime = idleStartTime;
     }

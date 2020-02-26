@@ -300,7 +300,7 @@ public class HttpClient extends NetworkClient {
         HttpClient ret = null;
         /* see if one's already around */
         if (useCache) {
-            ret = kac.get(url, null);
+            ret = kac.getIdle(url, null, httpuc);
             if (ret != null && httpuc != null &&
                 httpuc.streaming() &&
                 httpuc.getRequestMethod() == "POST") {
@@ -339,6 +339,7 @@ public class HttpClient extends NetworkClient {
         }
         if (ret == null) {
             ret = new HttpClient(url, p, to);
+            kac.putActive(ret, httpuc);
             if (httpuc != null) {
                 ret.authenticatorKey = httpuc.getAuthenticatorKey();
             }
@@ -446,7 +447,7 @@ public class HttpClient extends NetworkClient {
             return;
         }
         inCache = true;
-        kac.put(url, null, this);
+        kac.putIdle(url, null, this);
     }
 
     protected synchronized boolean isInKeepAliveCache() {
@@ -458,7 +459,7 @@ public class HttpClient extends NetworkClient {
      * cache).
      */
     public void closeIdleConnection() {
-        HttpClient http = kac.get(url, null);
+        HttpClient http = kac.getIdle(url, null, null);
         if (http != null) {
             http.closeServer();
         }

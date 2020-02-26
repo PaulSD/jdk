@@ -327,7 +327,7 @@ final class HttpsClient extends HttpClient
         HttpsClient ret = null;
         if (useCache) {
             /* see if one's already around */
-            ret = (HttpsClient) kac.get(url, sf);
+            ret = (HttpsClient) kac.getIdle(url, sf, httpuc);
             if (ret != null && httpuc != null &&
                 httpuc.streaming() &&
                 httpuc.getRequestMethod() == "POST") {
@@ -370,6 +370,7 @@ final class HttpsClient extends HttpClient
         }
         if (ret == null) {
             ret = new HttpsClient(sf, url, p, connectTimeout);
+            kac.putActive(ret, httpuc);
             if (httpuc != null) {
                 ret.authenticatorKey = httpuc.getAuthenticatorKey();
             }
@@ -655,7 +656,7 @@ final class HttpsClient extends HttpClient
             return;
         }
         inCache = true;
-        kac.put(url, sslSocketFactory, this);
+        kac.putIdle(url, sslSocketFactory, this);
     }
 
     /*
@@ -663,7 +664,7 @@ final class HttpsClient extends HttpClient
      */
     @Override
     public void closeIdleConnection() {
-        HttpClient http = kac.get(url, sslSocketFactory);
+        HttpClient http = kac.getIdle(url, sslSocketFactory, null);
         if (http != null) {
             http.closeServer();
         }
