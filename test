@@ -1,0 +1,13 @@
+#!/bin/bash 
+set -e
+
+[ -f keystore ] || keytool -genkeypair -keyalg RSA -sigalg SHA256withRSA -keysize 2048 -validity 90 -keystore ./keystore -alias server -dname "CN=localhost" -storepass changeit -keypass changeit
+TRUST='-Djavax.net.ssl.keyStore=keystore -Djavax.net.ssl.trustStore=keystore'
+TRUSTPW='-Djavax.net.ssl.keyStorePassword=changeit'
+
+echo
+java -version
+echo '---'
+javac Test.java
+ARGS='-Djava.util.logging.config.file=logging.properties -XX:+PrintGCDetails -XX:+PrintGCDateStamps'
+java $ARGS $TRUST $TRUSTPW Test
