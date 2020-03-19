@@ -1,0 +1,4 @@
+Boot-Class-Path: javassist.jar
+Premain-Class: Test
+Can-Retransform-Classes: true
+Main-Class: Test

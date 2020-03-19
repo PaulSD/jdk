@@ -1,5 +1,7 @@
-#!/bin/bash 
+#!/bin/bash
 set -e
+
+[ -f javassist.jar ] || wget -O javassist.jar https://repo1.maven.org/maven2/org/javassist/javassist/3.26.0-GA/javassist-3.26.0-GA.jar
 
 [ -f keystore ] || keytool -genkeypair -keyalg RSA -sigalg SHA256withRSA -keysize 2048 -validity 90 -keystore ./keystore -alias server -dname "CN=localhost" -storepass changeit -keypass changeit
 TRUST='-Djavax.net.ssl.keyStore=keystore -Djavax.net.ssl.trustStore=keystore'
@@ -8,6 +10,7 @@ TRUSTPW='-Djavax.net.ssl.keyStorePassword=changeit'
 echo
 java -version
 echo '---'
-javac Test.java
-ARGS='-Djava.util.logging.config.file=logging.properties -XX:+PrintGCDetails -XX:+PrintGCDateStamps'
-java $ARGS $TRUST $TRUSTPW Test
+javac -classpath javassist.jar Test.java
+jar cmf manifest Test.jar *.class
+ARGS='-Djava.util.logging.config.file=logging.properties'
+java $ARGS $TRUST $TRUSTPW -javaagent:Test.jar -jar Test.jar
